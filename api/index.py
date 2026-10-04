@@ -2,6 +2,10 @@
 import re
 from html.parser import HTMLParser
 from html import unescape
+import os
+import tempfile
+import json
+from pathlib import Path
 from flask import Flask, request, jsonify, Response
 import apprise
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
@@ -485,6 +489,505 @@ def prepare_body_for_urls(
     return converted, "markdown"
 
 
+# ─── Telegram Rich Message（方案 3）──────────────────────────────────────────
+
+def _is_telegram_url(raw_url: str) -> bool:
+    _, actual = _split_tag_prefix(raw_url)
+    scheme = actual.split("://", 1)[0].lower() if "://" in actual else ""
+    return scheme in ("tgram", "telegram")
+
+
+def _append_url_param(url: str, key: str, value: str) -> str:
+    """安全追加 query 参数（保留已有参数）"""
+    from urllib.parse import quote
+
+    prefix, actual = _split_tag_prefix(url)
+    sep = "&" if "?" in actual else "?"
+    encoded = quote(str(value), safe="")
+    return prefix + actual + f"{sep}{key}={encoded}"
+
+
+def _build_telegram_rich_blocks(
+    body: str,
+    title: str = "",
+    body_format: str = "markdown",
+) -> dict:
+    """
+    将 Markdown/HTML 转为 Telegram InputRichMessage 的 blocks 结构。
+    返回: {"blocks": [...]}
+    """
+    from html.parser import HTMLParser
+
+    # ---------- DOM ----------
+    VOID = {
+        "area", "base", "br", "col", "embed", "hr", "img",
+        "input", "link", "meta", "param", "source", "track", "wbr",
+    }
+
+    class Node:
+        __slots__ = ("tag", "attrs", "children", "text")
+
+        def __init__(self, tag=None, attrs=None, text=None):
+            self.tag = tag
+            self.attrs = dict(attrs or [])
+            self.children = []
+            self.text = text
+
+    class TreeParser(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.root = Node("__root__")
+            self.stack = [self.root]
+
+        def handle_starttag(self, tag, attrs):
+            tag = tag.lower()
+            node = Node(tag, attrs)
+            self.stack[-1].children.append(node)
+            if tag not in VOID:
+                self.stack.append(node)
+
+        def handle_startendtag(self, tag, attrs):
+            self.stack[-1].children.append(Node(tag.lower(), attrs))
+
+        def handle_endtag(self, tag):
+            tag = tag.lower()
+            for i in range(len(self.stack) - 1, 0, -1):
+                if self.stack[i].tag == tag:
+                    del self.stack[i:]
+                    return
+
+        def handle_data(self, data):
+            if data:
+                self.stack[-1].children.append(Node(None, text=data))
+
+        def handle_comment(self, data):
+            pass
+
+    # ---------- helpers ----------
+    def descendants(node, tag):
+        out = []
+        for c in node.children:
+            if c.tag == tag:
+                out.append(c)
+            out.extend(descendants(c, tag))
+        return out
+
+    def text_content(node, preserve=False):
+        parts = []
+
+        def walk(n):
+            if n.tag is None:
+                parts.append(n.text or "")
+                return
+            if n.tag == "img":
+                parts.append(n.attrs.get("alt", "") or "")
+                return
+            if n.tag == "br":
+                parts.append("\n")
+                return
+            for c in n.children:
+                walk(c)
+
+        walk(node)
+        t = "".join(parts)
+        return t if preserve else re.sub(r"\s+", " ", t).strip()
+
+    def merge_rich(parts):
+        result = []
+        for p in parts:
+            if p is None or p == "" or p == []:
+                continue
+            if isinstance(p, list):
+                result.extend(p)
+            else:
+                result.append(p)
+        if not result:
+            return ""
+        if len(result) == 1:
+            return result[0]
+        return result
+
+    def filename_from_url(url: str) -> str:
+        if not url:
+            return ""
+        path = url.split("?")[0].split("#")[0]
+        name = path.rstrip("/").split("/")[-1]
+        if name and not name.startswith("."):
+            return name
+        return ""
+
+    def get_img_alt(node):
+        return (node.attrs.get("alt") or "").strip()
+
+    # ---------- inline ----------
+    def render_inline(nodes):
+        parts = []
+        for node in nodes:
+            if node.tag is None:
+                if node.text:
+                    parts.append(node.text)
+                continue
+            tag = node.tag
+
+            if tag == "br":
+                parts.append("\n")
+            elif tag == "img":
+                alt = get_img_alt(node)
+                if alt:
+                    parts.append(alt)
+            elif tag in ("b", "strong"):
+                parts.append({
+                    "type": "bold",
+                    "text": merge_rich(render_inline(node.children)),
+                })
+            elif tag in ("i", "em"):
+                parts.append({
+                    "type": "italic",
+                    "text": merge_rich(render_inline(node.children)),
+                })
+            elif tag in ("u", "ins"):
+                parts.append({
+                    "type": "underline",
+                    "text": merge_rich(render_inline(node.children)),
+                })
+            elif tag in ("s", "strike", "del"):
+                parts.append({
+                    "type": "strikethrough",
+                    "text": merge_rich(render_inline(node.children)),
+                })
+            elif tag == "mark":
+                parts.append({
+                    "type": "marked",
+                    "text": merge_rich(render_inline(node.children)),
+                })
+            elif tag == "code":
+                parts.append({
+                    "type": "code",
+                    "text": text_content(node, preserve=True),
+                })
+            elif tag == "a":
+                href = node.attrs.get("href", "")
+                img_nodes = [c for c in node.children if c.tag == "img"]
+                text_nodes = [
+                    c for c in node.children
+                    if c.tag is None and (c.text or "").strip()
+                ]
+                other = [
+                    c for c in node.children
+                    if c.tag not in (None, "img", "br")
+                ]
+                is_image_link = (
+                    len(img_nodes) >= 1 and not text_nodes and not other
+                )
+
+                if is_image_link:
+                    alt = get_img_alt(img_nodes[0])
+                    display = alt or filename_from_url(href) or href
+                    if href:
+                        parts.append({
+                            "type": "url",
+                            "text": display,
+                            "url": href,
+                        })
+                    else:
+                        parts.append(display)
+                else:
+                    child = merge_rich(render_inline(node.children))
+                    if href and child:
+                        parts.append({
+                            "type": "url",
+                            "text": child,
+                            "url": href,
+                        })
+                    elif child:
+                        parts.append(child)
+                    elif href:
+                        short = filename_from_url(href) or href
+                        parts.append({
+                            "type": "url",
+                            "text": short,
+                            "url": href,
+                        })
+            else:
+                parts.append(render_inline(node.children))
+        return parts
+
+    # ---------- blocks ----------
+    def render_paragraph(node):
+        rich = merge_rich(render_inline(node.children))
+        if not rich or (isinstance(rich, str) and not rich.strip()):
+            return None
+        return {"type": "paragraph", "text": rich}
+
+    def render_list(node):
+        items = []
+        for li in [c for c in node.children if c.tag == "li"]:
+            content = [c for c in li.children if c.tag not in ("ul", "ol")]
+            blocks = []
+            rich = merge_rich(render_inline(content))
+            if rich:
+                blocks.append({"type": "paragraph", "text": rich})
+            for nested in [c for c in li.children if c.tag in ("ul", "ol")]:
+                blocks.extend(render_blocks(nested))
+            item = {"blocks": blocks or [{"type": "paragraph", "text": ""}]}
+            checkbox = next(
+                (
+                    c for c in li.children
+                    if c.tag == "input" and c.attrs.get("type") == "checkbox"
+                ),
+                None,
+            )
+            if checkbox is not None:
+                item["has_checkbox"] = True
+                item["is_checked"] = "checked" in checkbox.attrs
+            if node.tag == "ol":
+                item["value"] = len(items) + 1
+            items.append(item)
+        if not items:
+            return None
+        return {"type": "list", "items": items}
+
+    def render_table(node):
+        rows = descendants(node, "tr")
+        output_rows = []
+        for row in rows:
+            cells = []
+            for cell in [c for c in row.children if c.tag in ("th", "td")]:
+                cell_obj = {
+                    "text": merge_rich(render_inline(cell.children)) or ""
+                }
+                if cell.tag == "th":
+                    cell_obj["is_header"] = True
+                for attr, key in (("rowspan", "rowspan"), ("colspan", "colspan")):
+                    try:
+                        v = int(cell.attrs.get(attr, "1"))
+                        if v > 1:
+                            cell_obj[key] = v
+                    except (TypeError, ValueError):
+                        pass
+                align = cell.attrs.get("align")
+                if align in ("left", "center", "right"):
+                    cell_obj["align"] = align
+                cells.append(cell_obj)
+            if cells:
+                output_rows.append(cells)
+        if not output_rows:
+            return None
+        max_cols = max(len(r) for r in output_rows)
+        if max_cols > 20:
+            return {
+                "type": "paragraph",
+                "text": "Table omitted: more than 20 columns.",
+            }
+        if len(output_rows) > 80:
+            return {
+                "type": "paragraph",
+                "text": f"Table omitted: too many rows ({len(output_rows)}).",
+            }
+        table = {
+            "type": "table",
+            "cells": output_rows,
+            "is_bordered": True,
+            "is_striped": True,
+            "is_compact": True,
+        }
+        caption = next((c for c in node.children if c.tag == "caption"), None)
+        if caption:
+            cap = merge_rich(render_inline(caption.children))
+            if cap:
+                table["caption"] = cap
+        return table
+
+    def render_blocks(node):
+        result = []
+        tag = node.tag
+
+        if tag in (
+            "__root__", "div", "section", "article", "main",
+            "thead", "tbody", "tfoot",
+        ):
+            for c in node.children:
+                result.extend(render_blocks(c))
+            return result
+
+        if tag == "p":
+            b = render_paragraph(node)
+            return [b] if b else []
+
+        if tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
+            rich = merge_rich(render_inline(node.children))
+            if not rich:
+                return []
+            return [{
+                "type": "heading",
+                "text": rich,
+                "size": int(tag[1]),
+            }]
+
+        if tag == "pre":
+            code = next(iter(descendants(node, "code")), None)
+            raw = text_content(node, preserve=True).strip("\n")
+            block = {"type": "pre", "text": raw}
+            if code:
+                m = re.search(
+                    r"(?:^|\s)language-([\w+-]+)",
+                    code.attrs.get("class", ""),
+                )
+                if m:
+                    block["language"] = m.group(1)
+            return [block]
+
+        if tag == "hr":
+            return [{"type": "divider"}]
+
+        if tag in ("ul", "ol"):
+            b = render_list(node)
+            return [b] if b else []
+
+        if tag == "blockquote":
+            if "expandable" in node.attrs:
+                rich = merge_rich(render_inline(node.children))
+                if rich:
+                    return [{"type": "expandable_blockquote", "text": rich}]
+                return []
+            inner = []
+            for c in node.children:
+                inner.extend(render_blocks(c))
+            if inner:
+                return [{"type": "blockquote", "blocks": inner}]
+            return []
+
+        if tag == "table":
+            b = render_table(node)
+            return [b] if b else []
+
+        if tag is None:
+            t = re.sub(r"\s+", " ", node.text or "").strip()
+            if t:
+                return [{"type": "paragraph", "text": t}]
+            return []
+
+        rich = merge_rich(render_inline(node.children))
+        child_has_block = any(
+            c.tag in (
+                "p", "h1", "h2", "h3", "h4", "h5", "h6",
+                "ul", "ol", "blockquote", "table", "pre", "hr",
+            )
+            for c in node.children
+        )
+        if rich and not child_has_block:
+            return [{"type": "paragraph", "text": rich}]
+        for c in node.children:
+            result.extend(render_blocks(c))
+        return result
+
+    def to_html(source: str, fmt: str) -> str:
+        if fmt == "html":
+            return source
+        # markdown → html
+        try:
+            import markdown
+            # 任务列表预处理
+            def convert_task_lists(text):
+                def repl(m):
+                    indent, mark, content = m.group(1), m.group(2), m.group(3)
+                    checked = " checked" if mark.lower() == "x" else ""
+                    return f'{indent}- <input type="checkbox"{checked} disabled> {content}'
+                return re.sub(
+                    r"(?m)^(\s*)[-*+]\s+\[([ xX])\]\s+(.*)$",
+                    repl,
+                    text,
+                )
+            source = convert_task_lists(source)
+            # commit 短 hash：去掉代码样式，保留可点击链接
+            source = re.sub(
+                r"\(\[`([0-9a-f]{4,40})`\]\((https://[^)]+/commit/[^)]+)\)\)",
+                r"([\1](\2))",
+                source,
+            )
+            return markdown.markdown(source, extensions=["extra"])
+        except Exception:
+            # 降级：简单换行
+            from html import escape
+            return escape(source).replace("\n", "<br>\n")
+
+    html = to_html(body or "", body_format or "markdown")
+    parser = TreeParser()
+    parser.feed(html)
+    parser.close()
+    content_blocks = render_blocks(parser.root)
+
+    blocks = []
+    if title and title.strip():
+        blocks.append({
+            "type": "heading",
+            "text": title.strip(),
+            "size": 2,
+        })
+        blocks.append({"type": "divider"})
+
+    blocks.extend(content_blocks)
+    blocks = [b for b in blocks if b]
+
+    # 体积保护
+    MAX_BYTES = 32000
+    MAX_BLOCKS = 480
+
+    def payload_size(p):
+        return len(
+            json.dumps(p, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        )
+
+    def count_blocks(blks):
+        total = 0
+        for b in blks:
+            if not isinstance(b, dict):
+                continue
+            total += 1
+            if "blocks" in b:
+                total += count_blocks(b["blocks"])
+            if "items" in b:
+                for it in b.get("items", []):
+                    total += count_blocks(it.get("blocks", []))
+            if "cells" in b:
+                total += sum(len(r) for r in b["cells"])
+        return total
+
+    payload = {"blocks": blocks}
+    while blocks and (
+        payload_size(payload) > MAX_BYTES or count_blocks(blocks) > MAX_BLOCKS
+    ):
+        blocks.pop()
+        if title:
+            # 保留标题+分割线，从内容尾部删
+            if len(blocks) <= 2:
+                break
+        payload = {"blocks": blocks}
+
+    if payload_size(payload) > MAX_BYTES or count_blocks(payload["blocks"]) > MAX_BLOCKS:
+        payload["blocks"].append({
+            "type": "footer",
+            "text": "… Content truncated due to length limits.",
+        })
+
+    return payload
+
+
+def _write_rich_template(payload: dict) -> str:
+    """写入临时 JSON 文件，返回路径"""
+    fd, path = tempfile.mkstemp(prefix="tg-rich-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
+    except Exception:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+    return path
+
+
 # ─── 路由 ─────────────────────────────────────────────────────────────────────
 
 
@@ -528,47 +1031,145 @@ def notify():
         return jsonify({"error": "Missing or invalid 'urls' field"}), 400
 
     icon = form.get("icon", "").strip() or DEFAULT_ICON
-    apobj, added = _build_apprise(url_list, icon)
-
-    if added == 0:
-        return jsonify({"error": "Failed to add any valid Apprise URLs"}), 500
-
     body = form.get("body", "") or ""
     title = form.get("title", "") or ""
     notify_type = form.get("type", "info")
     body_format = form.get("format", "text")
 
-    # 方案 2：按渠道决定是否把 HTML 表格转成 Markdown
-    body, body_format = prepare_body_for_urls(body, body_format, url_list)
+    # 分流：Telegram vs 其它
+    telegram_urls = [u for u in url_list if _is_telegram_url(u)]
+    other_urls = [u for u in url_list if not _is_telegram_url(u)]
+
+    success_count = 0
+    failed_count = 0
+    errors = []
+    temp_files = []
 
     try:
-        notify_result = apobj.notify(
-            body=body,
-            title=title,
-            notify_type=notify_type,
-            body_format=body_format,
-        )
-    except Exception as e:
-        return jsonify({"error": f"Notification failed: {e}"}), 500
+        # ── 其它渠道（方案 2）──────────────────────────────────────────────
+        if other_urls:
+            other_body, other_fmt = prepare_body_for_urls(
+                body, body_format, other_urls
+            )
+            apobj, added = _build_apprise(other_urls, icon)
+            if added == 0:
+                failed_count += len(other_urls)
+                errors.append("Failed to add any non-Telegram URLs")
+            else:
+                try:
+                    result = apobj.notify(
+                        body=other_body,
+                        title=title,
+                        notify_type=notify_type,
+                        body_format=other_fmt,
+                    )
+                    if result:
+                        success_count += getattr(
+                            result, "success_count", added
+                        )
+                        failed_count += getattr(result, "failed_count", 0)
+                    else:
+                        failed_count += added
+                        errors.append("Non-Telegram notification failed")
+                except Exception as e:
+                    failed_count += added
+                    errors.append(f"Non-Telegram error: {e}")
 
-    if not notify_result:
-        status_name = (
-            notify_result.status.name if hasattr(notify_result, "status") else "FAILURE"
-        )
+        # ── Telegram Rich Message（方案 3）────────────────────────────────
+        if telegram_urls:
+            try:
+                # text 也按 markdown 轻量处理；html/markdown 正常转 blocks
+                fmt_for_rich = (
+                    body_format if body_format in ("html", "markdown") else "markdown"
+                )
+                payload = _build_telegram_rich_blocks(
+                    body=body,
+                    title=title,
+                    body_format=fmt_for_rich,
+                )
+                template_path = _write_rich_template(payload)
+                temp_files.append(template_path)
+
+                decorated = []
+                for u in telegram_urls:
+                    # 先走原有图标装饰，再挂 template
+                    u2 = decorate_url(u, icon)
+                    u2 = _append_url_param(u2, "template", template_path)
+                    decorated.append(u2)
+
+                apobj_tg = apprise.Apprise(
+                    asset=apprise.AppriseAsset()
+                )
+                # 可选：logo
+                try:
+                    apobj_tg.asset.image_url_logo = icon
+                except Exception:
+                    pass
+
+                added_tg = 0
+                for u in decorated:
+                    try:
+                        if apobj_tg.add(u):
+                            added_tg += 1
+                    except Exception as e:
+                        print(f"Failed to add Telegram URL: {e}")
+
+                if added_tg == 0:
+                    failed_count += len(telegram_urls)
+                    errors.append("Failed to add any Telegram URLs")
+                else:
+                    # template 模式下 body/title 会被忽略结构，仍可传占位
+                    result_tg = apobj_tg.notify(
+                        body=body or " ",
+                        title=title or " ",
+                        notify_type=notify_type,
+                        body_format="html",  # template 路径下影响较小
+                    )
+                    if result_tg:
+                        success_count += getattr(
+                            result_tg, "success_count", added_tg
+                        )
+                        failed_count += getattr(result_tg, "failed_count", 0)
+                    else:
+                        failed_count += added_tg
+                        errors.append("Telegram Rich Message failed")
+            except Exception as e:
+                failed_count += len(telegram_urls)
+                errors.append(f"Telegram Rich Message error: {e}")
+                print(f"Telegram rich error: {e}")
+
+    finally:
+        for p in temp_files:
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+    if success_count == 0 and failed_count > 0:
         return (
             jsonify(
                 {
-                    "error": f"Notification failed or partially failed (Status: {status_name})",
-                    "success_count": getattr(notify_result, "success_count", 0),
-                    "failed_count": getattr(notify_result, "failed_count", 0),
+                    "error": "; ".join(errors) or "All notifications failed",
+                    "success_count": success_count,
+                    "failed_count": failed_count,
+                }
+            ),
+            500,
+        )
+
+    if failed_count > 0:
+        return (
+            jsonify(
+                {
+                    "error": "Partial failure: " + "; ".join(errors),
+                    "success_count": success_count,
+                    "failed_count": failed_count,
                 }
             ),
             500,
         )
 
     result = {"status": "OK"}
-    success_count = getattr(notify_result, "success_count", added)
     if success_count > 1:
         result["count"] = success_count
-
     return jsonify(result)
