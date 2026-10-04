@@ -1,7 +1,4 @@
 # api/index.py
-import re
-from html.parser import HTMLParser
-from html import unescape
 import os
 import tempfile
 import json
@@ -338,155 +335,6 @@ def _build_apprise(url_list: list[str], icon_url: str) -> tuple[apprise.Apprise,
             print(f"Failed to add Apprise URL '{u}': {e}")
 
     return apobj, added
-
-
-# ─── HTML 表格 → Markdown（仅用于弱 HTML 渠道）────────────────────────────────
-
-
-class _SingleTableToMd(HTMLParser):
-    """把单个 <table>...</table> 转成 Markdown 表格字符串"""
-
-    def __init__(self):
-        super().__init__(convert_charrefs=True)
-        self.in_row = False
-        self.in_cell = False
-        self.rows = []
-        self.current_row = []
-        self.current_cell = []
-
-    def handle_starttag(self, tag, attrs):
-        tag = tag.lower()
-        if tag == "tr":
-            self.in_row = True
-            self.current_row = []
-        elif tag in ("th", "td"):
-            self.in_cell = True
-            self.current_cell = []
-        elif tag == "br" and self.in_cell:
-            self.current_cell.append(" ")
-
-    def handle_endtag(self, tag):
-        tag = tag.lower()
-        if tag in ("th", "td") and self.in_cell:
-            text = "".join(self.current_cell).strip()
-            text = re.sub(r"\s+", " ", text)
-            # Markdown 表格单元格内的 | 需要转义
-            text = text.replace("|", "\\|")
-            self.current_row.append(text)
-            self.in_cell = False
-        elif tag == "tr" and self.in_row:
-            if self.current_row:
-                self.rows.append(self.current_row)
-            self.in_row = False
-
-    def handle_data(self, data):
-        if self.in_cell:
-            self.current_cell.append(data)
-
-    def to_markdown(self) -> str:
-        if not self.rows:
-            return ""
-        col_count = max(len(r) for r in self.rows)
-        # 补齐列
-        normalized = []
-        for r in self.rows:
-            row = r + [""] * (col_count - len(r))
-            normalized.append(row[:col_count])
-
-        header = normalized[0]
-        sep = ["---"] * col_count
-        lines = [
-            "| " + " | ".join(header) + " |",
-            "| " + " | ".join(sep) + " |",
-        ]
-        for row in normalized[1:]:
-            lines.append("| " + " | ".join(row) + " |")
-        return "\n".join(lines)
-
-
-def html_tables_to_markdown(html: str) -> str:
-    """
-    将 HTML 中的 <table> 转为 Markdown 表格，并去掉多余的表格相关标签。
-    其他内容尽量保留（简单清理），适合 Telegram / Discord / Slack 等渠道。
-    """
-    if not html or "<table" not in html.lower():
-        return html
-
-    result = html
-    tables = re.findall(r"(?is)<table\b[^>]*>.*?</table>", html)
-
-    for table_html in tables:
-        parser = _SingleTableToMd()
-        try:
-            parser.feed(table_html)
-            parser.close()
-            md = parser.to_markdown()
-        except Exception:
-            md = ""
-
-        if md:
-            result = result.replace(table_html, "\n\n" + md + "\n\n", 1)
-        else:
-            # 转换失败则去掉标签，保留文字
-            result = result.replace(table_html, "\n\n", 1)
-
-    # 清理残留的表格相关标签
-    result = re.sub(
-        r"(?is)</?(div|span|thead|tbody|tfoot|tr|td|th|table|br)[^>]*>",
-        lambda m: "\n" if m.group(0).lower().startswith("<br") else "",
-        result,
-    )
-    # 简单把常见块级标签换成换行，避免 Telegram HTML 报错
-    result = re.sub(r"(?is)</?(p|h[1-6]|li|ul|ol)[^>]*>", "\n", result)
-    result = re.sub(r"\n{3,}", "\n\n", result)
-    return result.strip()
-
-
-# 这些协议对 HTML 表格支持很弱，需要转成 Markdown
-_WEAK_HTML_SCHEMES = (
-    "tgram",
-    "telegram",
-    "discord",
-    "slack",
-    "bark",
-    "ntfy",
-    "msteams",
-    "mattermost",
-    "matrix",
-    "rocket",
-    "dingtalk",
-    "feishu",
-    "lark",
-)
-
-
-def _url_needs_table_convert(raw_url: str) -> bool:
-    """判断单个 URL 是否属于弱 HTML 渠道"""
-    # 去掉可能的标签前缀：alerts=tgram://... 或 1:alerts=tgram://...
-    _, actual = _split_tag_prefix(raw_url)
-    lower = actual.lower()
-    scheme = lower.split("://", 1)[0] if "://" in lower else lower
-    return any(scheme.startswith(s) for s in _WEAK_HTML_SCHEMES)
-
-
-def prepare_body_for_urls(
-    body: str, body_format: str, url_list: list[str]
-) -> tuple[str, str]:
-    """
-    根据目标渠道决定是否把 HTML 表格转成 Markdown。
-
-    - 全部是强 HTML 渠道（如 email）→ 保持 html
-    - 存在弱 HTML 渠道（Telegram 等）且 body 含 <table> → 转 Markdown
-    """
-    if body_format != "html" or not body or "<table" not in body.lower():
-        return body, body_format
-
-    needs_convert = any(_url_needs_table_convert(u) for u in url_list)
-    if not needs_convert:
-        return body, body_format
-
-    converted = html_tables_to_markdown(body)
-    return converted, "markdown"
 
 
 # ─── Telegram Rich Message（方案 3）──────────────────────────────────────────
@@ -1036,7 +884,6 @@ def notify():
     notify_type = form.get("type", "info")
     body_format = form.get("format", "text")
 
-    # 分流：Telegram vs 其它
     telegram_urls = [u for u in url_list if _is_telegram_url(u)]
     other_urls = [u for u in url_list if not _is_telegram_url(u)]
 
@@ -1046,11 +893,8 @@ def notify():
     temp_files = []
 
     try:
-        # ── 其它渠道（方案 2）──────────────────────────────────────────────
+        # ── 其它渠道：完全恢复原始逻辑 ─────────────────────────────────────
         if other_urls:
-            other_body, other_fmt = prepare_body_for_urls(
-                body, body_format, other_urls
-            )
             apobj, added = _build_apprise(other_urls, icon)
             if added == 0:
                 failed_count += len(other_urls)
@@ -1058,15 +902,13 @@ def notify():
             else:
                 try:
                     result = apobj.notify(
-                        body=other_body,
+                        body=body,
                         title=title,
                         notify_type=notify_type,
-                        body_format=other_fmt,
+                        body_format=body_format,  # 用户选什么就传什么，不做转换
                     )
                     if result:
-                        success_count += getattr(
-                            result, "success_count", added
-                        )
+                        success_count += getattr(result, "success_count", added)
                         failed_count += getattr(result, "failed_count", 0)
                     else:
                         failed_count += added
@@ -1075,10 +917,9 @@ def notify():
                     failed_count += added
                     errors.append(f"Non-Telegram error: {e}")
 
-        # ── Telegram Rich Message（方案 3）────────────────────────────────
+        # ── 仅 Telegram：Rich Message ─────────────────────────────────────
         if telegram_urls:
             try:
-                # text 也按 markdown 轻量处理；html/markdown 正常转 blocks
                 fmt_for_rich = (
                     body_format if body_format in ("html", "markdown") else "markdown"
                 )
@@ -1092,15 +933,11 @@ def notify():
 
                 decorated = []
                 for u in telegram_urls:
-                    # 先走原有图标装饰，再挂 template
                     u2 = decorate_url(u, icon)
                     u2 = _append_url_param(u2, "template", template_path)
                     decorated.append(u2)
 
-                apobj_tg = apprise.Apprise(
-                    asset=apprise.AppriseAsset()
-                )
-                # 可选：logo
+                apobj_tg = apprise.Apprise(asset=apprise.AppriseAsset())
                 try:
                     apobj_tg.asset.image_url_logo = icon
                 except Exception:
@@ -1118,17 +955,14 @@ def notify():
                     failed_count += len(telegram_urls)
                     errors.append("Failed to add any Telegram URLs")
                 else:
-                    # template 模式下 body/title 会被忽略结构，仍可传占位
                     result_tg = apobj_tg.notify(
                         body=body or " ",
                         title=title or " ",
                         notify_type=notify_type,
-                        body_format="html",  # template 路径下影响较小
+                        body_format="html",
                     )
                     if result_tg:
-                        success_count += getattr(
-                            result_tg, "success_count", added_tg
-                        )
+                        success_count += getattr(result_tg, "success_count", added_tg)
                         failed_count += getattr(result_tg, "failed_count", 0)
                     else:
                         failed_count += added_tg
