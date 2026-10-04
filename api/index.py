@@ -14,7 +14,7 @@ _OPENAPI_SPEC = {
     "openapi": "3.0.3",
     "info": {
         "title": "Apprise Notify API",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "description": "轻量无服务器消息推送，支持 Bark、ntfy、Discord、Telegram 等 100+ 渠道。",
     },
     "servers": [{"url": "/"}],
@@ -67,7 +67,14 @@ _OPENAPI_SPEC = {
                         },
                     },
                     "400": {"description": "参数错误"},
-                    "500": {"description": "发送失败"},
+                    "500": {
+                        "description": "发送失败或部分失败",
+                        "content": {
+                            "application/json": {
+                                "schema": {"$ref": "#/components/schemas/ErrorResponse"}
+                            }
+                        },
+                    },
                 },
             },
         }
@@ -124,6 +131,14 @@ _OPENAPI_SPEC = {
                         "type": "integer",
                         "description": "成功发送的目标数量，多目标时才返回",
                     },
+                },
+            },
+            "ErrorResponse": {
+                "type": "object",
+                "properties": {
+                    "error": {"type": "string"},
+                    "success_count": {"type": "integer"},
+                    "failed_count": {"type": "integer"},
                 },
             },
             "StatusResponse": {
@@ -234,7 +249,7 @@ def _parse_url_list(urls_input) -> list[str]:
 
 def _split_tag_prefix(raw_url: str) -> tuple[str, str]:
     """
-    分离 Apprise 1.11.0+ 标签前缀，返回 (prefix_with_eq, actual_url)。
+    分离 Apprise 标签前缀，返回 (prefix_with_eq, actual_url)。
 
     支持格式：
       tgram://...            → ('', 'tgram://...')
@@ -256,9 +271,7 @@ def _split_tag_prefix(raw_url: str) -> tuple[str, str]:
 
 
 def decorate_url(raw_url: str, icon_url: str) -> str:
-    """按协议类型为 URL 注入图标、分组等默认参数（仅在参数缺失时补充，不覆盖已有值）。
-    兼容 Apprise 1.11.0+ 的 [priority:]tag=url 前缀格式。
-    """
+    """按协议类型为 URL 注入图标、分组等默认参数（仅在参数缺失时补充，不覆盖已有值）。"""
     if not icon_url:
         return raw_url
 
@@ -307,7 +320,16 @@ def _build_apprise(url_list: list[str], icon_url: str) -> tuple[apprise.Apprise,
     asset = apprise.AppriseAsset()
     asset.image_url_logo = icon_url
     apobj = apprise.Apprise(asset=asset)
-    added = sum(1 for u in url_list if apobj.add(decorate_url(u, icon_url)))
+
+    added = 0
+    for u in url_list:
+        try:
+            # Apprise v2 遇到无效配置可能会直接抛出异常而不是静默忽略
+            if apobj.add(decorate_url(u, icon_url)):
+                added += 1
+        except Exception as e:
+            print(f"Failed to add Apprise URL '{u}': {e}")
+
     return apobj, added
 
 
@@ -360,7 +382,9 @@ def notify():
         return jsonify({"error": "Failed to add any valid Apprise URLs"}), 500
 
     try:
-        success = apobj.notify(
+        # Apprise v2 底层会默认并行发送（Parallel delivery by default）
+        # 返回的是详细的 AppriseResult 对象
+        notify_result = apobj.notify(
             body=form.get("body", ""),
             title=form.get("title", ""),
             notify_type=form.get("type", "info"),
@@ -369,10 +393,26 @@ def notify():
     except Exception as e:
         return jsonify({"error": f"Notification failed: {e}"}), 500
 
-    if not success:
-        return jsonify({"error": "Failed to send (check URL params)"}), 500
+    # 在 v2 中，如果含有任何 PARTIAL(部分失败)、FAILURE、TIMEOUT、NOMATCH 情况，bool 评估都会得到 False
+    if not notify_result:
+        status_name = (
+            notify_result.status.name if hasattr(notify_result, "status") else "FAILURE"
+        )
+        return (
+            jsonify(
+                {
+                    "error": f"Notification failed or partially failed (Status: {status_name})",
+                    "success_count": getattr(notify_result, "success_count", 0),
+                    "failed_count": getattr(notify_result, "failed_count", 0),
+                }
+            ),
+            500,
+        )
 
     result = {"status": "OK"}
-    if added > 1:
-        result["count"] = added
+    # 使用 v2 提供的实际发送成功数量，而不是仅仅被解析出来的数量，数据更精确
+    success_count = getattr(notify_result, "success_count", added)
+    if success_count > 1:
+        result["count"] = success_count
+
     return jsonify(result)

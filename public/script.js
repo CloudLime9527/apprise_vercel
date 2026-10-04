@@ -524,6 +524,10 @@ const app = {
                 this.addToHistory(payload);
             } else {
                 resArea.classList.add('response-err');
+                // v2：如果是部分失败 (有成功发送的记录)，依然存入历史记录
+                if (data.success_count && data.success_count > 0) {
+                    this.addToHistory(payload);
+                }
             }
         } catch (e) {
             resArea.innerText = 'Error: ' + e.message;
